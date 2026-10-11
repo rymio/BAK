@@ -28,6 +28,8 @@ struct Env {
     _tmp: TempDir,
     root: PathBuf,
     proj: PathBuf,
+    /// Extra environment for every `bak` run (REST credentials).
+    vars: std::cell::RefCell<Vec<(String, String)>>,
 }
 
 impl Env {
@@ -43,6 +45,7 @@ impl Env {
             _tmp: tmp,
             root,
             proj,
+            vars: Default::default(),
         }
     }
 
@@ -58,7 +61,16 @@ impl Env {
             .env_remove("BAK_REST_USER")
             .env_remove("BAK_REST_PASSWORD")
             .stdin(Stdio::null());
+        for (k, v) in self.vars.borrow().iter() {
+            c.env(k, v);
+        }
         c
+    }
+
+    fn set_var(&self, key: &str, value: &str) {
+        let mut vars = self.vars.borrow_mut();
+        vars.retain(|(k, _)| k != key);
+        vars.push((key.to_string(), value.to_string()));
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -589,7 +601,7 @@ fn t09_rest_remote() {
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         make_fixture(&env.proj, 8, 500);
         env.ok(&["init"]);
         let url = format!("rest:http://127.0.0.1:{port}/proj");
@@ -600,7 +612,7 @@ fn t09_rest_remote() {
         let out = env.path("rest-restore");
         env.ok(&["restore", "home", "latest", "--to", out.to_str().unwrap()]);
         assert_same_tree(&env.proj, &out);
-    });
+    }));
     let _ = server.kill();
     let _ = server.wait();
     result.unwrap();
@@ -716,7 +728,7 @@ fn t11_secrets() {
 fn t12_no_unsafe() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut hits = Vec::new();
-    for krate in ["bak-core", "bak-engine-rustic", "bak-cli"] {
+    for krate in ["bak-core", "bak-engine-rustic", "bak-cli", "bak-server"] {
         let src = crates.join(krate).join("src");
         for e in fs::read_dir(&src).unwrap() {
             let p = e.unwrap().path();
@@ -732,6 +744,55 @@ fn t12_no_unsafe() {
     assert!(hits.is_empty(), "unsafe found in {hits:?}");
     let ws = fs::read_to_string(crates.parent().unwrap().join("Cargo.toml")).unwrap();
     assert!(ws.contains("unsafe_code = \"forbid\""));
+}
+
+// Extra: size reports stored bytes that match the repository on disk.
+#[test]
+fn t14_size() {
+    let env = Env::new();
+    make_fixture(&env.proj, 4, 50);
+    let repo = env.init_with_disk();
+    env.push("disk", "one");
+    env.push("disk", "two");
+    let v = env.json(&["size", "disk"]);
+    let s = &v[0]["stats"];
+    let on_disk: u64 = {
+        fn walk(p: &Path) -> u64 {
+            fs::read_dir(p)
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        walk(&p)
+                    } else {
+                        fs::metadata(&p).unwrap().len()
+                    }
+                })
+                .sum()
+        }
+        walk(&repo)
+    };
+    // stored_bytes leaves out only the repository's tiny `config` file.
+    let stored = s["stored_bytes"].as_u64().unwrap();
+    assert!(
+        stored <= on_disk && on_disk - stored < 1024,
+        "{stored} vs {on_disk}"
+    );
+    assert_eq!(s["snapshots"], 2);
+    let latest = s["latest_source_bytes"].as_u64().unwrap();
+    assert!(latest >= 4 * MIB as u64);
+    let log = env.json(&["log", "disk"]);
+    let sum: u64 = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["size"].as_u64().unwrap())
+        .sum();
+    assert_eq!(s["all_snapshots_source_bytes"].as_u64().unwrap(), sum);
+    // Two identical snapshots must not cost twice the space.
+    assert!(stored < latest + latest / 2);
+    assert!(log[0]["added"].as_u64().unwrap() > 0);
+    assert!(log[1]["added"].as_u64().unwrap() < 64 * 1024);
 }
 
 // Extra: copy between remotes deduplicates when chunker parameters are shared.
@@ -761,4 +822,610 @@ fn t13_copy() {
     ]);
     // Adding the usb remote changed config.toml after the snapshot was taken.
     assert_same_tree_except(&env.proj, &restored, &[".bak/config.toml"]);
+}
+
+// ---------------------------------------------------------------------------
+// bak-server: the bak client against the bundled server.
+
+struct Server {
+    addr: std::net::SocketAddr,
+    data: PathBuf,
+}
+
+fn start_server(
+    env: &Env,
+    append_only: bool,
+    private_repos: bool,
+    tls: bool,
+) -> (Server, Option<PathBuf>) {
+    let data = env.path("server");
+    fs::create_dir_all(&data).unwrap();
+    let htpasswd = data.join(".htpasswd");
+    bak_server::auth::set_user(&htpasswd, "rob", "rob-server-pw-1").unwrap();
+    bak_server::auth::set_user(&htpasswd, "eve", "eve-server-pw-2").unwrap();
+    let (tls_config, ca) = if tls {
+        let hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let g = bak_server::tls::ensure_generated(&data.join(".tls"), &hosts).unwrap();
+        (
+            Some(bak_server::tls::server_config(&g.cert, &g.key).unwrap()),
+            Some(g.ca),
+        )
+    } else {
+        (None, None)
+    };
+    let cfg = bak_server::Config {
+        path: data.clone(),
+        append_only,
+        private_repos,
+        htpasswd: Some(htpasswd),
+        verbose: false,
+        dashboard: true,
+    };
+    let addr = bak_server::spawn("127.0.0.1:0", cfg, tls_config).unwrap();
+    (Server { addr, data }, ca)
+}
+
+fn login(env: &Env, user: &str, password: &str) {
+    env.set_var("BAK_REST_USER", user);
+    env.set_var("BAK_REST_PASSWORD", password);
+}
+
+/// Minimal HTTP/1.1 client for protocol checks. Returns the status code.
+fn http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    auth: (&str, &str),
+    body: &[u8],
+) -> u16 {
+    use std::net::TcpStream;
+    let mut s = TcpStream::connect(addr).unwrap();
+    let creds = base64(format!("{}:{}", auth.0, auth.1).as_bytes());
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    s.write_all(body).unwrap();
+    let mut resp = String::new();
+    BufReader::new(s).read_line(&mut resp).unwrap();
+    resp.split(' ').nth(1).unwrap().parse().unwrap()
+}
+
+fn base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in input.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    // A known vector keeps this test free of a hashing dependency.
+    assert!(data.is_empty());
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into()
+}
+
+// Server 1: round trip and incremental push over HTTP with logins.
+#[test]
+fn s01_server_round_trip() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, false, false, false);
+    make_fixture(&env.proj, 8, 500);
+    env.ok(&["init"]);
+    login(&env, "rob", "rob-server-pw-1");
+    let url = format!("rest:http://{}/rob/proj", server.addr);
+    env.ok(&["remote", "add", "home", &url, "--yes"]);
+    let first = env.push("home", "first");
+    assert!(first["data_blobs_added"].as_u64().unwrap() > 0);
+    let second = env.push("home", "second");
+    assert_eq!(second["data_blobs_added"], 0);
+    env.ok(&["verify", "home", "--read-data"]);
+    let out = env.path("restored");
+    env.ok(&["restore", "home", "latest", "--to", out.to_str().unwrap()]);
+    assert_same_tree(&env.proj, &out);
+    assert!(server.data.join("rob/proj/config").exists());
+}
+
+// Server 2: HTTPS with the generated private CA.
+#[test]
+fn s02_server_tls() {
+    let env = Env::new();
+    let (server, ca) = start_server(&env, false, false, true);
+    let ca = ca.unwrap();
+    make_fixture(&env.proj, 1, 50);
+    env.ok(&["init"]);
+    login(&env, "rob", "rob-server-pw-1");
+    let url = format!("rest:https://localhost:{}/rob/proj", server.addr.port());
+    // Without the CA the certificate is rejected...
+    let out = env.run(&["remote", "add", "home", &url, "--yes"]);
+    assert!(!out.status.success(), "untrusted certificate was accepted");
+    // ...and with it everything works.
+    env.ok(&[
+        "remote",
+        "add",
+        "home",
+        &url,
+        "--yes",
+        "--cacert",
+        ca.to_str().unwrap(),
+    ]);
+    env.push("home", "over tls");
+    let out = env.path("restored");
+    env.ok(&["restore", "home", "latest", "--to", out.to_str().unwrap()]);
+    assert_same_tree_except(&env.proj, &out, &[".bak/config.toml"]);
+}
+
+// Server 3: append-only refuses deletes and overwrites but backups still work.
+#[test]
+fn s03_server_append_only() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, true, false, false);
+    make_fixture(&env.proj, 1, 50);
+    env.ok(&["init"]);
+    login(&env, "rob", "rob-server-pw-1");
+    let url = format!("rest:http://{}/rob/proj", server.addr);
+    env.ok(&["remote", "add", "home", &url, "--yes"]);
+    env.push("home", "one");
+    fs::write(env.proj.join("new.txt"), "two").unwrap();
+    env.push("home", "two");
+    let auth = ("rob", "rob-server-pw-1");
+    let snap = fs::read_dir(server.data.join("rob/proj/snapshots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+    assert_eq!(
+        http(
+            server.addr,
+            "DELETE",
+            &format!("/rob/proj/snapshots/{snap}"),
+            auth,
+            b""
+        ),
+        403
+    );
+    assert_eq!(
+        http(server.addr, "DELETE", "/rob/proj/config", auth, b""),
+        403
+    );
+    assert_eq!(
+        http(server.addr, "POST", "/rob/proj/config", auth, b"overwrite"),
+        403
+    );
+    assert_eq!(env.json(&["log", "home"]).as_array().unwrap().len(), 2);
+}
+
+// Server 4: logins and private repositories.
+#[test]
+fn s04_server_auth() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, false, true, false);
+    make_fixture(&env.proj, 0, 10);
+    env.ok(&["init"]);
+
+    // Wrong password: refused, and the password is not echoed.
+    login(&env, "rob", "not-the-password-7");
+    let url = format!("rest:http://{}/rob/proj", server.addr);
+    let out = env.run(&["remote", "add", "home", &url, "--yes"]);
+    assert!(!out.status.success());
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains("not-the-password-7"), "{all}");
+
+    // eve cannot use rob's area.
+    login(&env, "eve", "eve-server-pw-2");
+    assert!(!env
+        .run(&["remote", "add", "home", &url, "--yes"])
+        .status
+        .success());
+    assert!(!server.data.join("rob").exists());
+
+    // rob can.
+    login(&env, "rob", "rob-server-pw-1");
+    env.ok(&["remote", "add", "home", &url, "--yes"]);
+    env.push("home", "mine");
+    assert_eq!(
+        http(
+            server.addr,
+            "GET",
+            "/rob/proj/config",
+            ("eve", "eve-server-pw-2"),
+            b""
+        ),
+        401
+    );
+    assert_eq!(
+        http(
+            server.addr,
+            "GET",
+            "/rob/proj/config",
+            ("rob", "wrong"),
+            b""
+        ),
+        401
+    );
+    assert_eq!(
+        http(
+            server.addr,
+            "GET",
+            "/.htpasswd",
+            ("rob", "rob-server-pw-1"),
+            b""
+        ),
+        404
+    );
+}
+
+// Server 5: uploads are checked against their name, and retries are idempotent.
+#[test]
+fn s05_server_upload_checks() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, true, false, false);
+    let auth = ("rob", "rob-server-pw-1");
+    assert_eq!(
+        http(server.addr, "POST", "/rob/x/?create=true", auth, b""),
+        200
+    );
+    let empty = sha256_hex(b"");
+    // Correct name: stored. Retried: still OK (append-only does not break retries).
+    assert_eq!(
+        http(
+            server.addr,
+            "POST",
+            &format!("/rob/x/keys/{empty}"),
+            auth,
+            b""
+        ),
+        200
+    );
+    assert_eq!(
+        http(
+            server.addr,
+            "POST",
+            &format!("/rob/x/keys/{empty}"),
+            auth,
+            b""
+        ),
+        200
+    );
+    // Content that does not match its name: rejected, nothing stored.
+    let wrong = "1".repeat(64);
+    assert_eq!(
+        http(
+            server.addr,
+            "POST",
+            &format!("/rob/x/keys/{wrong}"),
+            auth,
+            b"junk"
+        ),
+        400
+    );
+    assert!(!server.data.join(format!("rob/x/keys/{wrong}")).exists());
+    // No temp files left behind.
+    let leftovers: Vec<_> = fs::read_dir(server.data.join("rob/x/keys"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// Server 6: restic can use bak-server too.
+#[test]
+fn s06_server_restic_client() {
+    if !on_path("restic") {
+        eprintln!("NOTICE: restic not on PATH; bak-server restic client test skipped");
+        return;
+    }
+    let env = Env::new();
+    let (server, _) = start_server(&env, false, false, false);
+    make_fixture(&env.proj, 2, 50);
+    env.ok(&["init"]);
+    login(&env, "rob", "rob-server-pw-1");
+    let url = format!("rest:http://{}/rob/proj", server.addr);
+    env.ok(&["remote", "add", "home", &url, "--yes"]);
+    env.push("home", "for restic");
+    let out = env.path("restic-restore");
+    let r = Command::new("restic")
+        .args([
+            "-r",
+            &format!("rest:http://rob:rob-server-pw-1@{}/rob/proj", server.addr),
+        ])
+        .args([
+            "--no-cache",
+            "restore",
+            "latest",
+            "--target",
+            out.to_str().unwrap(),
+        ])
+        .env("RESTIC_PASSWORD", PASSPHRASE)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    assert_same_tree(&env.proj, &out);
+}
+
+// ---------------------------------------------------------------------------
+// bak-server dashboard.
+
+struct HttpResp {
+    status: u16,
+    headers: String,
+    body: String,
+}
+
+/// HTTP/1.1 request with optional cookie and JSON body (plain HTTP test server).
+fn http_req(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    xbak: bool,
+    body: &str,
+) -> HttpResp {
+    use std::net::TcpStream;
+    let mut s = TcpStream::connect(addr).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n", body.len());
+    if let Some(c) = cookie {
+        req += &format!("Cookie: bak_session={c}\r\n");
+    }
+    if xbak {
+        req += "X-Bak: 1\r\n";
+    }
+    req += "\r\n";
+    s.write_all(req.as_bytes()).unwrap();
+    s.write_all(body.as_bytes()).unwrap();
+    let mut raw = String::new();
+    BufReader::new(s).read_to_string(&mut raw).unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    HttpResp {
+        status,
+        headers: head.to_ascii_lowercase(),
+        body: body.to_string(),
+    }
+}
+
+fn dash_login(addr: std::net::SocketAddr, user: &str, password: &str) -> String {
+    let r = http_req(
+        addr,
+        "POST",
+        "/_/api/login",
+        None,
+        true,
+        &serde_json::json!({ "user": user, "password": password }).to_string(),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let line = r
+        .headers
+        .lines()
+        .find(|l| l.starts_with("set-cookie:"))
+        .unwrap()
+        .to_string();
+    assert!(
+        line.contains("httponly") && line.contains("samesite=strict"),
+        "{line}"
+    );
+    line.split("bak_session=")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+// Dashboard 1: an admin creates a user, that user backs up, and the dashboard shows it.
+#[test]
+fn d01_dashboard_flow() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, true, true, false);
+    let addr = server.addr;
+    let admins = server.data.join(".admins");
+    bak_server::guard::set_admin(&admins, "rob", true).unwrap();
+
+    // No session, or no X-Bak header: refused.
+    assert_eq!(
+        http_req(addr, "GET", "/_/api/me", None, false, "").status,
+        401
+    );
+    assert_eq!(
+        http_req(
+            addr,
+            "POST",
+            "/_/api/login",
+            None,
+            false,
+            r#"{"user":"rob","password":"rob-server-pw-1"}"#
+        )
+        .status,
+        403
+    );
+    let page = http_req(addr, "GET", "/_/", None, false, "");
+    assert_eq!(page.status, 200);
+    assert!(page.headers.contains("content-security-policy"));
+
+    let admin = dash_login(addr, "rob", "rob-server-pw-1");
+    let me: serde_json::Value =
+        serde_json::from_str(&http_req(addr, "GET", "/_/api/me", Some(&admin), false, "").body)
+            .unwrap();
+    assert_eq!(me["admin"], true);
+
+    // Create a user with a generated password.
+    let r = http_req(
+        addr,
+        "POST",
+        "/_/api/users",
+        Some(&admin),
+        true,
+        r#"{"name":"ann","generate":true}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let created: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    let ann_pw = created["password"].as_str().unwrap().to_string();
+    assert_eq!(ann_pw.len(), 20);
+    assert_eq!(
+        http_req(
+            addr,
+            "POST",
+            "/_/api/users",
+            Some(&admin),
+            true,
+            r#"{"name":"bob","password":"short"}"#
+        )
+        .status,
+        400
+    );
+
+    // ann backs up with bak using that password.
+    make_fixture(&env.proj, 1, 20);
+    env.ok(&["init"]);
+    login(&env, "ann", &ann_pw);
+    env.ok(&[
+        "remote",
+        "add",
+        "home",
+        &format!("rest:http://{addr}/ann/proj"),
+        "--yes",
+    ]);
+    env.push("home", "from ann");
+
+    // ann sees only her repository and cannot manage users.
+    let ann = dash_login(addr, "ann", &ann_pw);
+    let repos: serde_json::Value =
+        serde_json::from_str(&http_req(addr, "GET", "/_/api/repos", Some(&ann), false, "").body)
+            .unwrap();
+    assert_eq!(repos.as_array().unwrap().len(), 1);
+    assert_eq!(repos[0]["path"], "/ann/proj");
+    assert_eq!(repos[0]["snapshots"], 1);
+    assert!(repos[0]["bytes"].as_u64().unwrap() > 1024 * 1024);
+    assert_eq!(
+        http_req(addr, "GET", "/_/api/users", Some(&ann), false, "").status,
+        403
+    );
+    assert_eq!(
+        http_req(addr, "DELETE", "/_/api/users/rob", Some(&ann), true, "").status,
+        403
+    );
+
+    // The admin sees the backup in the activity log and overview.
+    let act = http_req(addr, "GET", "/_/api/activity", Some(&admin), false, "").body;
+    assert!(
+        act.contains("\"kind\":\"backup\"") && act.contains("/ann/proj"),
+        "{act}"
+    );
+    let ov: serde_json::Value = serde_json::from_str(
+        &http_req(addr, "GET", "/_/api/overview", Some(&admin), false, "").body,
+    )
+    .unwrap();
+    assert_eq!(ov["repos"], 1);
+    assert_eq!(ov["users"], 3);
+
+    // Resetting ann's password signs her out of the dashboard and changes her backup login.
+    let r = http_req(
+        addr,
+        "POST",
+        "/_/api/users/ann/password",
+        Some(&admin),
+        true,
+        r#"{"generate":true}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        http_req(addr, "GET", "/_/api/me", Some(&ann), false, "").status,
+        401
+    );
+    assert!(
+        !env.run(&["log", "home"]).status.success(),
+        "old password still works"
+    );
+
+    // Removing ann keeps her repository; the admin cannot remove themselves.
+    assert_eq!(
+        http_req(addr, "DELETE", "/_/api/users/ann", Some(&admin), true, "").status,
+        200
+    );
+    assert!(server.data.join("ann/proj/config").exists());
+    assert_eq!(
+        http_req(addr, "DELETE", "/_/api/users/rob", Some(&admin), true, "").status,
+        400
+    );
+
+    // Logout ends the session.
+    assert_eq!(
+        http_req(addr, "POST", "/_/api/logout", Some(&admin), true, "").status,
+        200
+    );
+    assert_eq!(
+        http_req(addr, "GET", "/_/api/me", Some(&admin), false, "").status,
+        401
+    );
+}
+
+// Dashboard 2: repeated wrong passwords lock the address out, for backup clients too.
+#[test]
+fn d02_lockout() {
+    let env = Env::new();
+    let (server, _) = start_server(&env, false, false, false);
+    let addr = server.addr;
+    for _ in 0..bak_server::guard::MAX_FAILURES {
+        assert_eq!(
+            http(
+                addr,
+                "GET",
+                "/rob/proj/config",
+                ("rob", "wrong-password"),
+                b""
+            ),
+            401
+        );
+    }
+    assert_eq!(
+        http(
+            addr,
+            "GET",
+            "/rob/proj/config",
+            ("rob", "rob-server-pw-1"),
+            b""
+        ),
+        429
+    );
+    let r = http_req(
+        addr,
+        "POST",
+        "/_/api/login",
+        None,
+        true,
+        r#"{"user":"rob","password":"rob-server-pw-1"}"#,
+    );
+    assert_eq!(r.status, 429);
+    // Repository names starting with `_` are reserved for the dashboard.
+    assert_ne!(
+        http(
+            addr,
+            "POST",
+            "/_x/?create=true",
+            ("eve", "eve-server-pw-2"),
+            b""
+        ),
+        200
+    );
 }

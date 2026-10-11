@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     pub password_file: Option<PathBuf>,
 
-    /// Machine-readable JSON output (status, log, ls, diff, push, verify).
+    /// Machine-readable JSON output (status, log, ls, diff, push, verify, size).
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -107,6 +107,8 @@ pub enum Command {
         #[arg(long)]
         read_data: bool,
     },
+    /// Show the space a remote uses and how much data it holds (all remotes when none is named).
+    Size { remote: Option<String> },
     /// Copy snapshots between remotes (all when none are named).
     Copy {
         from: String,
@@ -228,6 +230,7 @@ pub fn run(cli: Cli, engine: &dyn Engine) -> Result<()> {
             force,
         } => cmd_restore(&ctx, remote, snapshot, path.as_deref(), to, *force),
         Command::Verify { remote, read_data } => cmd_verify(&ctx, remote, *read_data),
+        Command::Size { remote } => cmd_size(&ctx, remote.as_deref()),
         Command::Copy {
             from,
             to,
@@ -584,15 +587,16 @@ fn cmd_log(ctx: &Ctx, remote: &str) -> Result<()> {
         return ctx.print_json(&snaps);
     }
     println!(
-        "{:<8}  {:<25}  {:>9}  {:>7}  {:<12}  MESSAGE",
-        "ID", "TIME", "SIZE", "FILES", "TAGS"
+        "{:<8}  {:<25}  {:>9}  {:>9}  {:>7}  {:<12}  MESSAGE",
+        "ID", "TIME", "SIZE", "ADDED", "FILES", "TAGS"
     );
     for s in &snaps {
         println!(
-            "{:<8}  {:<25}  {:>9}  {:>7}  {:<12}  {}",
+            "{:<8}  {:<25}  {:>9}  {:>9}  {:>7}  {:<12}  {}",
             s.short_id,
             s.time,
             human(s.size),
+            s.added.map(human).unwrap_or_else(|| "-".to_string()),
             s.files,
             s.tags.join(","),
             s.message.as_deref().unwrap_or("")
@@ -733,6 +737,86 @@ fn cmd_verify(ctx: &Ctx, remote: &str, read_data: bool) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn cmd_size(ctx: &Ctx, remote: Option<&str>) -> Result<()> {
+    let project = ctx.project()?;
+    let names: Vec<String> = match remote {
+        Some(r) => vec![r.to_string()],
+        None => project.config.remotes.keys().cloned().collect(),
+    };
+    if names.is_empty() {
+        bail!("no remotes configured");
+    }
+    let pass = ctx.passphrase(false)?;
+    let mut all = Vec::new();
+    let mut failed = false;
+    for name in &names {
+        let spec = ctx.remote(&project, name)?;
+        match ctx.engine.stats(&spec, pass) {
+            Ok(st) => all.push((name.clone(), spec.display_url(), st)),
+            Err(e) if remote.is_none() => {
+                failed = true;
+                eprintln!(
+                    "{name}: unreachable: {}",
+                    bak_core::redact::scrub(&format!("{e:#}"))
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if ctx.cli.json {
+        let v: Vec<_> = all
+            .iter()
+            .map(|(n, u, s)| serde_json::json!({ "remote": n, "url": u, "stats": s }))
+            .collect();
+        ctx.print_json(&v)?;
+    } else {
+        for (name, url, s) in &all {
+            print_size(name, url, s);
+        }
+    }
+    if failed {
+        bail!("some remotes could not be read");
+    }
+    Ok(())
+}
+
+fn print_size(name: &str, url: &str, s: &bak_core::RepoStats) {
+    let plural = |n: u64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    println!("{name}  {url}");
+    println!(
+        "  stored at remote    {:>10}  in {}, {}",
+        human(s.stored_bytes),
+        plural(s.stored_files, "file"),
+        plural(s.pack_files, "pack")
+    );
+    if s.snapshots == 0 {
+        println!("  no snapshots yet");
+        return;
+    }
+    println!(
+        "  unique data         {:>10}  ({} after compression)",
+        human(s.unique_data_bytes),
+        human(s.unique_data_stored_bytes)
+    );
+    println!(
+        "  latest snapshot     {:>10}  {}",
+        human(s.latest_source_bytes),
+        plural(s.latest_files, "file")
+    );
+    println!(
+        "  as full copies      {:>10}  ({} added up)",
+        human(s.all_snapshots_source_bytes),
+        plural(s.snapshots, "snapshot")
+    );
+    if s.stored_bytes > 0 && s.all_snapshots_source_bytes > s.stored_bytes {
+        println!(
+            "  space saved         {:>10}  ({:.1}x smaller)",
+            human(s.all_snapshots_source_bytes - s.stored_bytes),
+            s.all_snapshots_source_bytes as f64 / s.stored_bytes as f64
+        );
+    }
 }
 
 fn cmd_copy(ctx: &Ctx, from: &str, to: &str, snapshots: &[String]) -> Result<()> {

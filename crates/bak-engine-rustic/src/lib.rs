@@ -9,11 +9,11 @@ use std::sync::Arc;
 use bak_core::engine::NoProgress;
 use bak_core::{
     CopySummary, Engine, Entry, EntryKind, Error, InitOptions, Location, ProgressKind,
-    ProgressReporter, ProgressTask, PushSummary, RemoteSpec, RestoreSummary, Result, Secret,
-    SnapshotInfo, SnapshotRef, SnapshotRequest, VerifyProblem, VerifyReport,
+    ProgressReporter, ProgressTask, PushSummary, RemoteSpec, RepoStats, RestoreSummary, Result,
+    Secret, SnapshotInfo, SnapshotRef, SnapshotRequest, VerifyProblem, VerifyReport,
 };
 use rustic_backend::{LocalBackend, RestBackend};
-use rustic_core::repofile::{ConfigFile, Node, NodeType, SnapshotFile};
+use rustic_core::repofile::{BlobType, ConfigFile, FileType, Node, NodeType, SnapshotFile};
 use rustic_core::{
     BackupOptions, CheckOptions, ConfigOptions, Credentials, Id, KeyOptions, LocalDestination,
     LsOptions, PathList, Progress, ProgressBars, ProgressType, Repository, RepositoryBackends,
@@ -279,6 +279,35 @@ impl Engine for RusticEngine {
         Ok(VerifyReport { problems })
     }
 
+    fn stats(&self, remote: &RemoteSpec, passphrase: &Secret) -> Result<RepoStats> {
+        let repo = self.open(remote, passphrase)?;
+        let mut stats = RepoStats::default();
+        for f in repo.infos_files().map_err(err)?.repo {
+            stats.stored_files += f.count;
+            stats.stored_bytes += f.size;
+            if f.tpe == FileType::Pack {
+                stats.pack_files += f.count;
+                stats.pack_bytes += f.size;
+            }
+        }
+        for b in repo.infos_index().map_err(err)?.blobs {
+            if b.blob_type == BlobType::Data {
+                stats.unique_data_bytes += b.data_size;
+                stats.unique_data_stored_bytes += b.size;
+            }
+        }
+        let mut snaps = repo.get_all_snapshots().map_err(err)?;
+        snaps.sort_by(|a, b| a.time.cmp(&b.time));
+        stats.snapshots = snaps.len() as u64;
+        for s in &snaps {
+            let info = snapshot_info(s);
+            stats.all_snapshots_source_bytes += info.size;
+            stats.latest_source_bytes = info.size;
+            stats.latest_files = info.files;
+        }
+        Ok(stats)
+    }
+
     fn copy(
         &self,
         from: &RemoteSpec,
@@ -345,6 +374,7 @@ fn snapshot_info(snap: &SnapshotFile) -> SnapshotInfo {
         paths: snap.paths.iter().cloned().collect(),
         size: summary.total_bytes_processed,
         files: summary.total_files_processed,
+        added: snap.summary.as_ref().map(|s| s.data_added_packed),
     }
 }
 

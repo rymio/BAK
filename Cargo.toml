@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bak-core", "crates/bak-engine-rustic", "crates/bak-cli"]
+members = ["crates/bak-core", "crates/bak-engine-rustic", "crates/bak-cli", "crates/bak-server"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bak-server</title>
+<link rel="stylesheet" href="/_/app.css">
+<script src="/_/app.js" defer></script>
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card login-card" autocomplete="on">
+    <div class="brand"><span class="logo" aria-hidden="true"></span>bak-server</div>
+    <p class="muted">Sign in with your backup account.</p>
+    <label>User name<input name="user" autocomplete="username" required autofocus></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <p id="login-error" class="error" role="alert"></p>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+</div>
+
+<div id="app" class="layout" hidden>
+  <aside class="sidebar">
+    <div class="brand"><span class="logo" aria-hidden="true"></span>bak-server</div>
+    <nav id="nav">
+      <a href="#/overview" data-view="overview">Overview</a>
+      <a href="#/repos" data-view="repos">Repositories</a>
+      <a href="#/users" data-view="users" data-admin>Users</a>
+      <a href="#/activity" data-view="activity">Activity</a>
+      <a href="#/setup" data-view="setup">Connect a client</a>
+      <a href="#/account" data-view="account">Account</a>
+    </nav>
+    <div class="who">
+      <span id="who-name"></span>
+      <span id="who-role" class="badge"></span>
+      <button id="logout" class="link">Sign out</button>
+    </div>
+  </aside>
+  <main id="main" tabindex="-1"></main>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="card modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="actions"><button id="modal-close" class="primary">Done</button></div>
+  </div>
+</div>
+</body>
+</html>

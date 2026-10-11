@@ -61,6 +61,9 @@ pub trait Engine {
         read_data: bool,
     ) -> Result<VerifyReport>;
 
+    /// Space used by the repository and how much source data it holds.
+    fn stats(&self, remote: &RemoteSpec, passphrase: &Secret) -> Result<RepoStats>;
+
     /// Copy snapshots (all when `snapshots` is empty) to another repository.
     fn copy(
         &self,
@@ -128,6 +131,28 @@ pub struct SnapshotInfo {
     /// Bytes of source data in the snapshot.
     pub size: u64,
     pub files: u64,
+    /// Bytes this snapshot added to the repository (after compression), if recorded.
+    pub added: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoStats {
+    /// Everything stored at the remote: packs, index, snapshots and keys
+    /// (the repository's few-hundred-byte config file is not counted).
+    pub stored_bytes: u64,
+    pub stored_files: u64,
+    pub pack_files: u64,
+    pub pack_bytes: u64,
+    /// Unique file content, before compression and encryption.
+    pub unique_data_bytes: u64,
+    /// Unique file content as stored, after compression and encryption.
+    pub unique_data_stored_bytes: u64,
+    pub snapshots: u64,
+    /// Source size of the newest snapshot.
+    pub latest_source_bytes: u64,
+    pub latest_files: u64,
+    /// Sum of the source sizes of all snapshots: what full copies would take.
+    pub all_snapshots_source_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

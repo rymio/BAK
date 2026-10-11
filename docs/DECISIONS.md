@@ -39,3 +39,25 @@ Toolchain: rustc 1.97.0. `rustic_core` 0.13 uses let-chains, so it needs a recen
 - **Progress.** A terminal gets indicatif bars. Otherwise bak prints `progress: <title> <n>%` lines at 10% steps, which test 7 uses to interrupt a push at a deterministic point.
 - **Milestones.** The work was done in one session, so it is one commit, not five.
 - **Logging crate.** rustic logs through `log`, so bak uses `log` plus `env_logger`.
+
+## bak-server (added 2026-10-11)
+
+The SOW originally ruled out a custom server in favour of restic's `rest-server`. The owner changed that: the project now ships its own server, so the package is complete without a Go binary.
+
+- **Protocol.** restic's REST protocol, v1 and v2 listings, so `bak`, `restic` and `rustic` all work against it. Repositories are plain restic directories on disk, so a repository can move between bak-server and rest-server unchanged.
+- **Stack.** hyper and tokio directly, not axum: the routing is one strict path parser. TLS uses rustls with the aws-lc-rs provider, which reqwest already pulls in. New dependencies: `bcrypt` (htpasswd) and `rcgen` (certificates). `tokio-rustls`, `sha2`, `base64` and `tokio-util` were already in the tree.
+- **Certificates.** A generated private CA plus a server certificate it signs, instead of one self-signed certificate. macOS's certificate checker, which the bak client uses, is strict about self-signed leaf certificates. A CA also lets the server certificate be renewed (397-day validity, the macOS maximum) without clients changing anything. The CA's parameters are rebuilt deterministically, so renewal needs only the stored CA key and no X.509 parser.
+- **Writes.** Uploads are written to a temporary file, fsynced, checked against their SHA-256 name, and hard-linked into place. A hard link never replaces an existing file. A retried upload with identical content succeeds, which keeps append-only mode compatible with client retries.
+- **Internet exposure.**
+  - Plain HTTP on a non-loopback address is refused unless `--allow-http` is given.
+  - Ten failed logins from one IP within 15 minutes lock it out for 15 minutes. This covers backup clients and the dashboard.
+  - Passwords must be at least 12 characters, and generated ones are 20.
+  - The server binds its port and loads TLS before creating the first-run admin, so a failed start never prints a password that then goes unused.
+- **Dashboard.**
+  - Static HTML, CSS and JS compiled into the binary, with no CDN and no framework.
+  - A strict Content-Security-Policy with no inline scripts.
+  - Session cookies are HttpOnly, SameSite=Strict, and Secure under TLS. Mutating calls must carry an `X-Bak: 1` header.
+  - The `_` prefix is reserved for the dashboard, so repository and user names can't start with it.
+  - The dashboard can't delete repositories.
+- **Roles.** Admin names live in `.admins` next to the htpasswd file, because htpasswd has no place for roles.
+- **Not persisted.** The activity log and sessions are in memory, so a restart clears them. That's acceptable for v0.1.

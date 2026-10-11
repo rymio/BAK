@@ -3,6 +3,11 @@ BAK by Robert Rymarczyk, Licence MIT
 
 **Git-like backups for big project folders.** bak takes versioned, encrypted, deduplicated snapshots of a folder and pushes them to a USB drive, a second disk, an iCloud Drive or Google Drive folder, or your own server. You can browse, diff and restore any snapshot later.
 
+The package has two programs:
+
+- **`bak`**, the command-line client you run on your computer.
+- **`bak-server`**, an optional backup server for a machine you control (a home server, a VPS). It is safe to expose to the internet, has automatic HTTPS, user accounts, and a web dashboard.
+
 ```sh
 bak init
 bak remote add usb /Volumes/USB1/bak/myproj --require-mount
@@ -25,7 +30,7 @@ bak was built for large git repositories that are too big for GitHub or Bitbucke
 - [Remotes](#remotes)
 - [Configuration](#configuration)
 - [Passphrases and credentials](#passphrases-and-credentials)
-- [Running a backup server on Ubuntu](#running-a-backup-server-on-ubuntu)
+- [bak-server: your own backup server](#bak-server-your-own-backup-server)
 - [Restoring without bak](#restoring-without-bak)
 - [Limitations](#limitations)
 - [Development](#development)
@@ -69,13 +74,14 @@ You need Rust 1.88 or newer ([rustup.rs](https://rustup.rs)).
 git clone <this repository> bak
 cd bak
 cargo install --path crates/bak-cli      # installs `bak` into ~/.cargo/bin
+cargo install --path crates/bak-server   # optional: installs `bak-server`
 bak --version
 ```
 
 To build without installing:
 
 ```sh
-cargo build --release                     # binary at target/release/bak
+cargo build --release                     # binaries in target/release/: bak, bak-server
 ```
 
 ### Platforms
@@ -113,8 +119,9 @@ bak diff usb 0e423ab2 latest      # what changed between two snapshots
 bak restore usb latest --to ~/restore              # whole snapshot
 bak restore usb 0e423ab2 src/lib --to ~/restore    # one directory from an older snapshot
 
-# 7. Check the backup can be read.
+# 7. Check the backup can be read, and how much space it uses.
 bak verify usb --read-data
+bak size usb
 ```
 
 **Keep your passphrase somewhere safe.** Without it the backups cannot be decrypted, by bak or by anyone else.
@@ -133,12 +140,26 @@ A `<snapshot>` is a short id from `bak log` (such as `0e423ab2`) or `latest`.
 | `bak remote list` | List remotes. |
 | `bak remote remove <name>` | Unregister a remote. Data at the remote is never deleted. |
 | `bak push <remote> [-m <msg>] [--tag <tag>]...` | Snapshot all tracked paths. `--all` pushes to every remote in turn. |
-| `bak log <remote>` | List snapshots: id, time, size, file count, tags and message. |
+| `bak log <remote>` | List snapshots: id, time, source size, space the snapshot added at the remote, file count, tags and message. |
 | `bak ls <remote> <snapshot> [path]` | List files in a snapshot, optionally under one path. |
 | `bak diff <remote> <a> <b>` | Paths added (`+`), removed (`-`) and changed (`M`) between two snapshots. |
 | `bak restore <remote> <snapshot> [path] --to <dir>` | Restore a snapshot, or one path from it, into `<dir>`. Refuses a non-empty `<dir>` unless you pass `--force`, which overwrites matching files and never deletes anything. `bak pull` is an alias. |
 | `bak verify <remote> [--read-data]` | Check the repository structure. `--read-data` also reads and hashes every pack, which catches bit rot. |
+| `bak size [remote]` | Space used at the remote, unique data before and after compression, size of the latest snapshot, and the space saved compared with keeping full copies. Covers all remotes when none is named. |
 | `bak copy <from> <to> [snapshot...]` | Copy snapshots (all by default) to another remote without re-reading your files. |
+
+Example `bak size` output:
+
+```
+usb  /Volumes/USB1/bak/myproj
+  stored at remote      47.7 MiB  in 11 files, 5 packs
+  unique data           69.8 MiB  (47.7 MiB after compression)
+  latest snapshot       66.8 MiB  3 files
+  as full copies       200.3 MiB  (3 snapshots added up)
+  space saved          152.6 MiB  (4.2x smaller)
+```
+
+"Stored at remote" counts the data packs, index, snapshots and keys, which is what your drive or cloud quota sees (to within a few hundred bytes).
 
 bak finds the project by walking up from the current directory to the nearest `.bak/`, as git does with `.git/`.
 
@@ -146,7 +167,7 @@ These options work with every command:
 
 | Option | Meaning |
 | --- | --- |
-| `--json` | JSON output for `status`, `log`, `ls`, `diff`, `push` and `verify`. |
+| `--json` | JSON output for `status`, `log`, `ls`, `diff`, `push`, `verify` and `size`. |
 | `--password-file <file>` | Read the passphrase from a file (must be mode 0600). |
 | `-v`, `-vv` | Info or debug logging to stderr. Secrets are always masked. |
 
@@ -198,7 +219,7 @@ bak remote add home rest:https://backup.example.internal:8000/rob/myproj \
   --cacert ~/.config/bak/home-ca.pem
 ```
 
-The server is restic's [rest-server](https://github.com/restic/rest-server). See [Running a backup server on Ubuntu](#running-a-backup-server-on-ubuntu). Use `--cacert` when the server has a self-signed certificate.
+The server is [bak-server](#bak-server-your-own-backup-server), or restic's [rest-server](https://github.com/restic/rest-server): both speak the same protocol. `--cacert` takes the CA certificate of a server that uses its own certificates, which is what bak-server does by default.
 
 ### Copying between remotes
 
@@ -255,42 +276,84 @@ Use one passphrase for all remotes of a project. bak never writes it to disk, lo
 
 **Redaction.** Every secret is registered when it's read. Every log line and error message is scrubbed of secrets before printing, including errors raised inside the backup library.
 
-## Running a backup server on Ubuntu
+## bak-server: your own backup server
 
-bak talks to restic's `rest-server`. bak doesn't set the server up for you; these are the manual steps.
+`bak-server` turns any Linux or macOS machine into a backup target for `bak`, and for `restic` and `rustic` too, because it speaks restic's REST protocol. One binary includes:
+
+- **Automatic HTTPS.** On first start it creates its own private certificate authority and a server certificate signed by it, and renews the server certificate on its own. Clients trust the CA once. You can also bring your own certificate (for example from Let's Encrypt).
+- **User accounts,** with bcrypt-hashed passwords. The first start creates an `admin` account with a generated password.
+- **A web dashboard** at `https://<server>:8000/_/`. See [The dashboard](#the-dashboard).
+- **Protection for the open internet:**
+  - Plain HTTP is refused on public addresses.
+  - 10 failed logins from one IP within 15 minutes lock that IP out for 15 minutes.
+  - Paths are parsed strictly.
+  - Uploads are checked against their SHA-256 name.
+  - Files are never overwritten.
+- **Append-only mode,** so a stolen laptop can add backups but never delete or change old ones.
+- **Private repositories,** so each user can only reach repositories under `/<username>/`.
+
+The server never sees your data unencrypted. It doesn't have your passphrase, so it can show sizes and times but not file names or contents.
+
+### Quickstart
+
+On the server:
 
 ```sh
-# 1. Install. Download the latest linux_amd64 release from
-#    https://github.com/restic/rest-server/releases and unpack it.
-sudo install -m 755 rest-server /usr/local/bin/rest-server
-sudo useradd --system --home /srv/restic --shell /usr/sbin/nologin restic
-sudo mkdir -p /srv/restic && sudo chown restic: /srv/restic
-
-# 2. Create a user (bcrypt).
-sudo apt install apache2-utils
-sudo htpasswd -B -c /srv/restic/.htpasswd rob
-
-# 3. TLS. A self-signed certificate is fine: copy cert.pem to your Mac and pass it with --cacert.
-sudo openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
-  -keyout /srv/restic/key.pem -out /srv/restic/cert.pem \
-  -subj "/CN=backup.example.internal" \
-  -addext "subjectAltName=DNS:backup.example.internal"
-sudo chown restic: /srv/restic/*.pem
+bak-server serve --path /srv/bak --tls --append-only --private-repos \
+  --hostname backup.example.com
 ```
 
-Create `/etc/systemd/system/rest-server.service`:
+On first start it prints:
+
+```
+ First start: created administrator account
+   user:     admin
+   password: 4Pw6MzKyXNdK5aVVPZtv
+ This is shown only once. ...
+clients must trust /srv/bak/.tls/ca.pem
+bak-server 0.1.0 serving /srv/bak on https://0.0.0.0:8000
+  dashboard: https://<this host>:8000/_/
+```
+
+Then:
+
+1. **Sign in to the dashboard** at `https://backup.example.com:8000/_/` as `admin`. Your browser will warn that the certificate is not trusted; see [Certificates](#certificates). Go to **Users**, add an account for yourself, and leave the password empty to have one generated.
+2. **On your computer,** download the CA from **Connect a client** (or copy `/srv/bak/.tls/ca.pem`), then:
+
+```sh
+export BAK_REST_USER=rob BAK_REST_PASSWORD='<generated password>'
+bak remote add home rest:https://backup.example.com:8000/rob/myproj \
+  --cacert ~/.config/bak/bak-server-ca.pem
+bak push home -m "first backup"
+```
+
+### Running on Ubuntu with systemd
+
+```sh
+cargo build --release
+sudo install -m 755 target/release/bak-server /usr/local/bin/
+sudo useradd --system --home /srv/bak --shell /usr/sbin/nologin bak
+sudo mkdir -p /srv/bak && sudo chown bak: /srv/bak
+```
+
+Create `/etc/systemd/system/bak-server.service`:
 
 ```ini
 [Unit]
-Description=restic rest-server
-After=network.target
+Description=bak backup server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=restic
-ExecStart=/usr/local/bin/rest-server --path /srv/restic --listen :8000 \
-  --append-only --private-repos \
-  --tls --tls-cert /srv/restic/cert.pem --tls-key /srv/restic/key.pem
+User=bak
+ExecStart=/usr/local/bin/bak-server serve --path /srv/bak --listen 0.0.0.0:8000 \
+  --tls --append-only --private-repos --hostname backup.example.com
 Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/bak
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -298,11 +361,78 @@ WantedBy=multi-user.target
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now rest-server
+sudo systemctl enable --now bak-server
+sudo journalctl -u bak-server | grep -A3 'First start'    # the admin password, shown once
 ```
 
-- `--append-only` lets clients add backups but never delete or overwrite them, so a compromised laptop cannot wipe your history.
-- `--private-repos` limits each user to repositories under `/<username>/`, which is why the URL above is `…:8000/rob/myproj`.
+### Exposing it to the internet
+
+- **Forward one TCP port** (8000 in these examples) from your router or cloud firewall to the server. Nothing else needs to be open.
+- **Give every name clients use to `--hostname`**, repeating it as needed (for example `--hostname backup.example.com --hostname 203.0.113.7`). The server certificate is only valid for those names. Changing the list creates a new server certificate, signed by the same CA, so clients don't need anything new.
+- **Use `--append-only`.** Even if a client machine is compromised, your existing backups can't be deleted or altered through the server.
+- **Use `--private-repos`** when more than one person uses the server.
+- **Use generated passwords.** They're 20 characters, and a password must be at least 12 characters in any case. The lockout slows down guessing, but strong passwords are what actually stop it.
+- **Behind a reverse proxy** (Caddy, nginx) that terminates TLS, run `--listen 127.0.0.1:8000` without `--tls`. The lockout then sees the proxy's address for every client, so prefer bak-server's own TLS when you can.
+
+### Certificates
+
+With `--tls` and no certificate files, bak-server keeps these files in `<path>/.tls/`:
+
+| File | What it is |
+| --- | --- |
+| `ca.pem` | The private CA certificate. **Give this to clients** (`--cacert`). It is also downloadable from the dashboard. It is valid for 10 years. |
+| `ca-key.pem` | The CA's private key (mode 0600). Never share it. |
+| `cert.pem`, `key.pem` | The server certificate and its key. They're valid for 397 days, the maximum macOS accepts, and renewed automatically 30 days before expiry. |
+
+**Browsers** don't know your private CA, so the dashboard shows a certificate warning. To remove it, import `ca.pem` into your system or browser certificate store. On macOS: open it in Keychain Access and set *When using this certificate* to *Always Trust*.
+
+**To use your own certificate** instead, for example from Let's Encrypt via certbot, pass `--tls --tls-cert fullchain.pem --tls-key privkey.pem`. Clients then don't need `--cacert`.
+
+### The dashboard
+
+Open `https://<server>:8000/_/` and sign in with a bak-server account.
+
+| Page | What you can do |
+| --- | --- |
+| Overview | Repositories, stored size, snapshot count, time of the last backup, and backups in the last 24 hours. Admins also see users, failed sign-ins, locked-out IPs and traffic. |
+| Repositories | Each repository's path, owner, size, snapshots and packs, with a fresh / old / stale badge based on the last backup. |
+| Users (admins) | Add users, with a typed or generated password; reset passwords; grant or revoke admin; remove users. Removing a user keeps their repositories. |
+| Activity | Backups, repositories created, deletions, refusals in append-only mode, sign-ins, failed sign-ins, lockouts and user changes. |
+| Connect a client | The CA download and copy-paste `bak` commands for your account. |
+| Account | Change your own password, which needs your current one. |
+
+Regular users see only their own repositories and activity. Sessions last 12 hours, use HttpOnly SameSite=Strict cookies, and are signed out when the password changes. The dashboard never deletes repositories.
+
+### Managing users from the command line
+
+```sh
+bak-server user add rob --path /srv/bak --generate          # prints a generated password
+bak-server user add alice --path /srv/bak --admin           # asks for a password
+bak-server user list --path /srv/bak
+bak-server user remove rob --path /srv/bak                  # keeps rob's repositories
+```
+
+Users live in `<path>/.htpasswd`, in standard bcrypt htpasswd format, so `htpasswd -B` works too. Admins are listed in `<path>/.admins`.
+
+### `bak-server serve` options
+
+| Option | Meaning |
+| --- | --- |
+| `--path <dir>` | Where repositories live (required). |
+| `--listen <addr>` | Address and port to listen on. Default `0.0.0.0:8000`. |
+| `--tls` | Serve HTTPS. Generates certificates in `<path>/.tls` unless `--tls-cert` and `--tls-key` are given. |
+| `--hostname <name>` | A name or IP that clients use (repeatable). Used for generated certificates. |
+| `--append-only` | Refuse deletes (except lock files) and overwrites. |
+| `--private-repos` | Each user may only use `/<username>/…`. |
+| `--htpasswd <file>` | Users file (default `<path>/.htpasswd`). |
+| `--no-auth` | No logins, and no dashboard. Only for a trusted local network. |
+| `--no-dashboard` | Don't serve `/_/`. |
+| `--allow-http` | Allow plain HTTP on a non-loopback address, for use behind a TLS proxy or VPN. |
+| `-v`, `--verbose` | Log every request. |
+
+### Using restic's rest-server instead
+
+bak also works with restic's [rest-server](https://github.com/restic/rest-server) (`--append-only`, `--private-repos`, `--tls`, an htpasswd file). It has no dashboard and no automatic certificates.
 
 ## Restoring without bak
 
@@ -322,17 +452,19 @@ restic -r "rest:https://rob:PASSWORD@backup.example.internal:8000/rob/myproj" \
 - **Ownership** (user and group) is not restored. File contents, permissions, timestamps and symlinks are.
 - **Paths.** Remote and restore paths must be valid UTF-8. File names inside your project may be anything your filesystem allows.
 - **No scheduling.** bak doesn't run in the background or on a timer. Use cron or launchd if you want that.
-- **No FUSE mount, no GUI, no Windows.**
+- **No FUSE mount, no desktop GUI, no Windows.** The web dashboard belongs to bak-server and shows server-side information only.
+- **bak-server's activity log and sessions live in memory,** so they reset when the server restarts.
 
 ## Development
 
-The workspace has three crates. Only one of them depends on the backup library, so the engine can be replaced without touching the command line.
+The workspace has four crates. Only `bak-engine-rustic` depends on the backup library, so the engine can be replaced without touching the command line.
 
 | Crate | Role |
 | --- | --- |
 | [`crates/bak-core`](crates/bak-core) | Config, remotes, mount guard, secret redaction, snapshot diff, and the `Engine` trait. No library types in its API. |
 | [`crates/bak-engine-rustic`](crates/bak-engine-rustic) | The `Engine` implementation on rustic_core and rustic_backend, which are pinned to exact versions. |
 | [`crates/bak-cli`](crates/bak-cli) | The `bak` binary. Every command is written against `&dyn Engine`; `main.rs` is the only file that picks the engine. |
+| [`crates/bak-server`](crates/bak-server) | The `bak-server` binary: the restic REST protocol on hyper and rustls, htpasswd and bcrypt logins, generated certificates, lockout, and the dashboard (plain HTML, CSS and JS in `assets/`, compiled into the binary). |
 
 ```sh
 scripts/check.sh                  # cargo fmt --check, clippy -D warnings, all tests
@@ -354,8 +486,11 @@ The acceptance tests in [`crates/bak-cli/tests/acceptance.rs`](crates/bak-cli/te
 - the mount guard
 - secret redaction
 - copy
+- size
+- bak-server: round trip, HTTPS with the generated CA, append-only, logins and private repositories, upload checks, and restic as a client
+- the dashboard: user creation, a backup by that user, visibility rules, password reset, removal, logout, and lockout
 
-They run only in temporary directories. The restic interop and REST tests run when `restic` and `rest-server` are on your PATH, and are otherwise skipped with a notice.
+They run only in temporary directories. The bak-server tests start the server inside the test process. The restic interop and rest-server tests run when `restic` and `rest-server` are on your PATH, and are otherwise skipped with a notice.
 
 Design notes are in [`docs/DECISIONS.md`](docs/DECISIONS.md). [`docs/SPIKE-REPORT.md`](docs/SPIKE-REPORT.md) evaluates rustic_core as the engine.
 

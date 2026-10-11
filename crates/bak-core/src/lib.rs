@@ -14,8 +14,8 @@ pub mod remote;
 pub use config::{Config, Project, RemoteConfig};
 pub use engine::{
     CopySummary, Engine, Entry, EntryKind, InitOptions, ProgressKind, ProgressReporter,
-    ProgressTask, PushSummary, RestoreSummary, SnapshotInfo, SnapshotRef, SnapshotRequest,
-    VerifyProblem, VerifyReport,
+    ProgressTask, PushSummary, RepoStats, RestoreSummary, SnapshotInfo, SnapshotRef,
+    SnapshotRequest, VerifyProblem, VerifyReport,
 };
 pub use error::{Error, Result};
 pub use redact::Secret;

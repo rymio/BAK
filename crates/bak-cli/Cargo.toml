@@ -27,4 +27,5 @@ serde_json = "1.0.152"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+bak-server = { path = "../bak-server" }
 tempfile = "3.27.0"
