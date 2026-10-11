@@ -66,6 +66,32 @@ Under the hood bak uses [rustic_core](https://github.com/rustic-rs/rustic_core),
 
 ## Install
 
+### Installer scripts
+
+Each release archive (`bak-<version>-<os>-<arch>.tar.gz`) contains `bak`, `bak-server` and an installer. The installers also work from a source checkout, where they build with cargo first.
+
+| System | Command |
+| --- | --- |
+| macOS | `./installmac.sh` |
+| Linux | `./installlinux.sh` |
+| Windows | `./installwin.sh`, run inside WSL (see below) |
+
+By default the binaries go to `/usr/local/bin`, which is already on PATH; the installer asks for sudo if it needs it. Options:
+
+| Option | Effect |
+| --- | --- |
+| `--user` | Install to `~/.local/bin` without sudo, adding it to PATH in your shell profile if needed. |
+| `--prefix DIR` | Install to `DIR/bin`. |
+| `--client-only` | Install `bak` only. |
+| `--uninstall` | Remove the binaries. Backups and repositories are never touched. |
+| `--server-service HOST` | Linux only: also run bak-server as a systemd service on port 8000 with TLS, append-only and private repositories, storing data in `/srv/bak`, and print the admin password. |
+
+On macOS, the installer clears the download quarantine flag so Gatekeeper doesn't block the binaries.
+
+**Windows:** bak doesn't run natively on Windows yet. Install WSL (`wsl --install` in an administrator PowerShell, then restart), open Ubuntu, and run `./installwin.sh` there. Windows folders are under `/mnt/c/...`. Run from Git Bash, the script prints these steps.
+
+To build a release archive for the machine you're on: `scripts/package.sh` writes `dist/bak-<version>-<os>-<arch>.tar.gz` and a `.sha256` file.
+
 ### Build from source
 
 You need Rust 1.88 or newer ([rustup.rs](https://rustup.rs)).
