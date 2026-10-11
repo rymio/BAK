@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/bak-core", "crates/bak-engine-rustic", "crates/bak-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# rustic's chunking and crypto are unusably slow unoptimised; keep our own crates debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3

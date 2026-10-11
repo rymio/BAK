@@ -1,0 +1,17 @@
+[package]
+name = "bak-engine-rustic"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustic_core = "=0.13.0"
+rustic_backend = { version = "=0.7.0", default-features = false, features = ["rest"] }
+bak-core = { version = "0.1.0", path = "../bak-core" }
+serde_json = "1.0.152"
+bytesize = "2.3.1"
